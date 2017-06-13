@@ -23,6 +23,7 @@ import co.cask.cdap.proto.id.ProgramId;
 import co.cask.cdap.proto.id.StreamId;
 
 import java.util.Objects;
+import java.util.Set;
 import javax.annotation.Nullable;
 
 /**
@@ -199,68 +200,56 @@ public abstract class ProtoTrigger implements Trigger {
    * Represents a program status trigger for REST requests/responses
    */
   public static class ProgramStatusTrigger extends ProtoTrigger {
+    protected final ProgramId programId;
+    protected final Set<ProgramStatus> programStatuses;
 
-    protected final ProgramStatus programStatus;
-    protected final String namespace;
-    protected final String application;
-    protected final String applicationVersion;
-    protected final ProgramType programType;
-    protected final String programName;
-
-    public ProgramStatusTrigger(@Nullable String namespace, @Nullable String application,
-                                @Nullable String applicationVersion, ProgramType programType, String programName,
-                                ProgramStatus programStatus) {
+    public ProgramStatusTrigger(ProgramId programId, Set<ProgramStatus> programStatuses) {
       super(Type.PROGRAM_STATUS);
-      this.namespace = namespace;
-      this.application = application;
-      this.applicationVersion = applicationVersion;
-      this.programType = programType;
-      this.programName = programName;
-      this.programStatus = programStatus;
+
+      this.programId = programId;
+      this.programStatuses = programStatuses;
+      validate();
     }
 
-    public String getNamespace() {
-      return namespace;
+    public ProgramId getProgramId() {
+      return programId;
     }
 
-    public String getApplication() {
-      return application;
-    }
-
-    public String getApplicationVersion() {
-      return applicationVersion;
-    }
-
-    public ProgramType getProgramType() {
-      return programType;
-    }
-
-    public String getProgramName() {
-      return programName;
-    }
-
-    public ProgramStatus getProgramStatus() {
-      return programStatus;
+    public Set<ProgramStatus> getProgramStatuses() {
+      return programStatuses;
     }
 
     @Override
     public void validate() {
-      ProtoTrigger.validateNotNull(getNamespace(), "program namespace");
-      ProtoTrigger.validateNotNull(getApplication(), "program application");
-      ProtoTrigger.validateNotNull(getApplicationVersion(), "program application version");
-      ProtoTrigger.validateNotNull(getProgramName(), "program name");
-      ProtoTrigger.validateNotNull(getProgramType(), "program type");
-      ProtoTrigger.validateNotNull(getProgramStatus(), "program status");
+      if (getProgramStatuses().contains(ProgramStatus.INITIALIZING) ||
+          getProgramStatuses().contains(ProgramStatus.RUNNING)) {
+        throw new IllegalArgumentException(String.format(
+                "Cannot allow triggering program %s with status %s: COMPLETED, FAILED, KILLED statuses are supported",
+                programId.getProgram(), programId.getType()));
+      }
+
+      ProtoTrigger.validateNotNull(getProgramId(), "program id");
+      ProtoTrigger.validateNotNull(getProgramStatuses(), "program statuses");
     }
 
     @Override
     public int hashCode() {
-      return Objects.hash(namespace, application, applicationVersion, programType, programName, programStatus);
+      return Objects.hash(getProgramId(), getProgramStatuses());
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      return this == o ||
+        o != null &&
+          getClass().equals(o.getClass()) &&
+          Objects.equals(getProgramStatuses(), ((ProgramStatusTrigger) o).getProgramStatuses()) &&
+          Objects.equals(getProgramId(), ((ProgramStatusTrigger) o).getProgramId());
     }
 
     @Override
     public String toString() {
-      return String.format("ProgramStatusTrigger(%s, %s)", getProgramName(), getProgramStatus().toString());
+      return String.format("ProgramStatusTrigger(%s, %s)", getProgramId().getProgram(),
+                                                           getProgramStatuses().toString());
     }
   }
 
