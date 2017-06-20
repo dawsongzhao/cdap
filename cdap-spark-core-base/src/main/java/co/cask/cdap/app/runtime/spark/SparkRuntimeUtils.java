@@ -16,7 +16,9 @@
 
 package co.cask.cdap.app.runtime.spark;
 
+import co.cask.cdap.api.spark.SparkExecutionContext;
 import co.cask.cdap.app.runtime.spark.classloader.SparkRunnerClassLoader;
+import co.cask.cdap.app.runtime.spark.distributed.SparkDriverService;
 import co.cask.cdap.common.internal.guava.ClassPath;
 import co.cask.cdap.common.lang.ClassLoaders;
 import co.cask.cdap.common.lang.ClassPathResources;
@@ -28,6 +30,7 @@ import com.google.common.base.Predicate;
 import com.google.common.collect.Iterables;
 import com.google.common.io.OutputSupplier;
 import com.google.common.reflect.TypeToken;
+import com.google.common.util.concurrent.Service;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.google.gson.Gson;
 import org.apache.hadoop.conf.Configuration;
@@ -35,8 +38,11 @@ import org.apache.spark.SparkConf;
 import org.apache.spark.streaming.DStreamGraph;
 import org.apache.spark.streaming.StreamingContext;
 import org.apache.twill.common.Cancellable;
+import org.apache.twill.common.Threads;
+import org.apache.twill.internal.ServiceListenerAdapter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import scala.Option;
 import scala.Tuple2;
 import scala.collection.parallel.TaskSupport;
 import scala.collection.parallel.ThreadPoolTaskSupport;
@@ -45,6 +51,7 @@ import scala.collection.parallel.mutable.ParArray;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.net.URI;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -55,14 +62,16 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+import javax.annotation.Nullable;
 
 /**
  * Util class for common functions needed for Spark implementation.
  */
 public final class SparkRuntimeUtils {
 
-  private static final String LOCALIZED_RESOURCES = "spark.cdap.localized.resources";
+  public static final String CDAP_SPARK_EXECUTION_SERVICE_URI = "CDAP_SPARK_EXECUTION_SERVICE_URI";
 
+  private static final String LOCALIZED_RESOURCES = "spark.cdap.localized.resources";
   private static final Logger LOG = LoggerFactory.getLogger(SparkRuntimeUtils.class);
   private static final Gson GSON = new Gson();
 
@@ -283,6 +292,72 @@ public final class SparkRuntimeUtils {
       result.put(name, new File(dir, name));
     }
     return result;
+  }
+
+  /**
+   * Initialize a Spark main() method. This is the first method to be called from the main() method of any
+   * spark program.
+   *
+   * @return a {@link Cancellable} for releasing resources.
+   */
+  public static Cancellable initSparkMain() {
+    Thread mainThread = Thread.currentThread();
+    SparkClassLoader sparkClassLoader;
+    try {
+      sparkClassLoader = SparkClassLoader.findFromContext();
+    } catch (IllegalStateException e) {
+      sparkClassLoader = SparkClassLoader.create();
+    }
+
+    final Cancellable unsetClassLoader = SparkRuntimeUtils.setContextClassLoader(sparkClassLoader);
+
+    final SparkExecutionContext sec = sparkClassLoader.getSparkExecutionContext(true);
+    final Service driverService = startDriverServiceIfNecessary(sparkClassLoader.getRuntimeContext(), mainThread);
+    return new Cancellable() {
+      @Override
+      public void cancel() {
+        unsetClassLoader.cancel();
+
+        if (sec instanceof AutoCloseable) {
+          try {
+            ((AutoCloseable) sec).close();
+          } catch (Exception e) {
+            // Just log. It shouldn't throw, and if it does (due to bug), nothing much can be done
+            LOG.warn("Exception raised when calling {}.close()", sec, e);
+          }
+        }
+        if (driverService != null) {
+          driverService.stopAndWait();
+        }
+      }
+    };
+  }
+
+  /**
+   * Starts a {@link SparkDriverService} if needed (only used in distributed mode).
+   */
+  @Nullable
+  private static Service startDriverServiceIfNecessary(SparkRuntimeContext runtimeContext, final Thread mainThread) {
+    String executorServiceURI = System.getenv(CDAP_SPARK_EXECUTION_SERVICE_URI);
+    if (executorServiceURI == null) {
+      return null;
+    }
+
+    SparkDriverService driverService = new SparkDriverService(URI.create(executorServiceURI), runtimeContext);
+    driverService.addListener(new ServiceListenerAdapter() {
+      @Override
+      public void terminated(Service.State from) {
+        SparkRuntimeEnv.stop(Option.apply(mainThread));
+      }
+
+      @Override
+      public void failed(Service.State from, Throwable failure) {
+        SparkRuntimeEnv.stop(Option.apply(mainThread));
+      }
+    }, Threads.SAME_THREAD_EXECUTOR);
+
+    driverService.startAndWait();
+    return driverService;
   }
 
   private SparkRuntimeUtils() {
