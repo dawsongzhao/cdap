@@ -312,7 +312,9 @@ public final class SparkRuntimeUtils {
     final Cancellable unsetClassLoader = SparkRuntimeUtils.setContextClassLoader(sparkClassLoader);
 
     final SparkExecutionContext sec = sparkClassLoader.getSparkExecutionContext(true);
-    final Service driverService = startDriverServiceIfNecessary(sparkClassLoader.getRuntimeContext(), mainThread);
+    final SparkRuntimeContext runtimeContext = sparkClassLoader.getRuntimeContext();
+    final Service driverService = startDriverServiceIfNecessary(runtimeContext, mainThread);
+
     return new Cancellable() {
       @Override
       public void cancel() {
@@ -323,7 +325,8 @@ public final class SparkRuntimeUtils {
             ((AutoCloseable) sec).close();
           } catch (Exception e) {
             // Just log. It shouldn't throw, and if it does (due to bug), nothing much can be done
-            LOG.warn("Exception raised when calling {}.close()", sec, e);
+            LOG.warn("Exception raised when calling {}.close() for program run {}.",
+                     sec.getClass().getName(), runtimeContext.getProgramRunId(), e);
           }
         }
         if (driverService != null) {
