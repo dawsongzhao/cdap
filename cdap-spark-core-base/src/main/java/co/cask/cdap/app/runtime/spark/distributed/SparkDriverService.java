@@ -76,7 +76,7 @@ public class SparkDriverService extends AbstractExecutionThreadService {
   protected void startUp() throws Exception {
     runThread = Thread.currentThread();
 
-    // Make the first heartbeat, fail the startup if failed to make the heartbear
+    // Make the first heartbeat, fail the startup if failed to make the heartbeat
     heartbeat(client, workflowToken);
 
     // Schedule the credentials update if necessary
