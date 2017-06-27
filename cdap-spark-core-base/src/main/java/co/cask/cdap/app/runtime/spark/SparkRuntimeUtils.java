@@ -30,8 +30,10 @@ import com.google.common.base.Predicate;
 import com.google.common.collect.Iterables;
 import com.google.common.io.OutputSupplier;
 import com.google.common.reflect.TypeToken;
+import com.google.common.util.concurrent.AbstractService;
 import com.google.common.util.concurrent.Service;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.gson.Gson;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.SparkConf;
@@ -42,7 +44,6 @@ import org.apache.twill.common.Threads;
 import org.apache.twill.internal.ServiceListenerAdapter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import scala.Option;
 import scala.Tuple2;
 import scala.collection.parallel.TaskSupport;
 import scala.collection.parallel.ThreadPoolTaskSupport;
@@ -57,12 +58,12 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
-import javax.annotation.Nullable;
 
 /**
  * Util class for common functions needed for Spark implementation.
@@ -237,12 +238,14 @@ public final class SparkRuntimeUtils {
     // Always wrap it with WeakReference to avoid ClassLoader leakage from Spark.
     ClassLoader classLoader = new WeakReferenceDelegatorClassLoader(sparkClassLoader);
     hConf.setClassLoader(classLoader);
+
+    final Thread currentThread = Thread.currentThread();
     final ClassLoader oldClassLoader = ClassLoaders.setContextClassLoader(classLoader);
     return new Cancellable() {
       @Override
       public void cancel() {
         hConf.setClassLoader(oldConfClassLoader);
-        ClassLoaders.setContextClassLoader(oldClassLoader);
+        currentThread.setContextClassLoader(oldClassLoader);
 
         // Do not remove the next line.
         // This is necessary to keep a strong reference to the SparkClassLoader so that it won't get GC until this
@@ -301,7 +304,7 @@ public final class SparkRuntimeUtils {
    * @return a {@link Cancellable} for releasing resources.
    */
   public static Cancellable initSparkMain() {
-    Thread mainThread = Thread.currentThread();
+    final Thread mainThread = Thread.currentThread();
     SparkClassLoader sparkClassLoader;
     try {
       sparkClassLoader = SparkClassLoader.findFromContext();
@@ -309,17 +312,60 @@ public final class SparkRuntimeUtils {
       sparkClassLoader = SparkClassLoader.create();
     }
 
-    final Cancellable unsetClassLoader = SparkRuntimeUtils.setContextClassLoader(sparkClassLoader);
-
+    final Cancellable restoreMainClassLoader = SparkRuntimeUtils.setContextClassLoader(sparkClassLoader);
     final SparkExecutionContext sec = sparkClassLoader.getSparkExecutionContext(true);
     final SparkRuntimeContext runtimeContext = sparkClassLoader.getRuntimeContext();
-    final Service driverService = startDriverServiceIfNecessary(runtimeContext, mainThread);
 
-    return new Cancellable() {
+    String executorServiceURI = System.getenv(CDAP_SPARK_EXECUTION_SERVICE_URI);
+    final Service driverService;
+    if (executorServiceURI != null) {
+      // Creates the SparkDriverService in distributed mode for heartbeating and tokens update
+      driverService = new SparkDriverService(URI.create(executorServiceURI), runtimeContext);
+    } else {
+      // In local mode, just create a no-op service for state transition.
+      driverService = new AbstractService() {
+        @Override
+        protected void doStart() {
+          notifyStarted();
+        }
+
+        @Override
+        protected void doStop() {
+          notifyStopped();
+        }
+      };
+    }
+
+    // Watch for stopping of the driver service.
+    // It can happen when a user program finished such that the Cancellable.cancel() returned by this method is called,
+    // or it can happen when it received a stop command (distributed mode) in the SparkDriverService via heartbeat.
+    // In local mode, the LocalSparkSubmitter calls the Cancellable.cancel() returned by this methhod directly
+    // (via SparkMainWraper).
+    // We use a service listener so that it can handle all cases.
+    final CountDownLatch mainThreadCallLatch = new CountDownLatch(1);
+    driverService.addListener(new ServiceListenerAdapter() {
+
       @Override
-      public void cancel() {
-        unsetClassLoader.cancel();
+      public void terminated(Service.State from) {
+        handleStopped();
+      }
 
+      @Override
+      public void failed(Service.State from, Throwable failure) {
+        handleStopped();
+      }
+
+      private void handleStopped() {
+        // Avoid interrupt/join on the current thread
+        if (Thread.currentThread() != mainThread) {
+          mainThread.interrupt();
+          // If it is spark streaming, wait for the user class call returns from the main thread.
+          if (SparkRuntimeEnv.getStreamingContext().isDefined()) {
+            Uninterruptibles.awaitUninterruptibly(mainThreadCallLatch);
+          }
+        }
+
+        // Close the SparkExecutionContext (it will stop all the SparkContext and release all resources)
         if (sec instanceof AutoCloseable) {
           try {
             ((AutoCloseable) sec).close();
@@ -329,41 +375,21 @@ public final class SparkRuntimeUtils {
                      sec.getClass().getName(), runtimeContext.getProgramRunId(), e);
           }
         }
-        if (driverService != null) {
-          driverService.stopAndWait();
-        }
-      }
-    };
-  }
-
-  /**
-   * Starts a {@link SparkDriverService} if needed (only used in distributed mode).
-   */
-  @Nullable
-  private static Service startDriverServiceIfNecessary(SparkRuntimeContext runtimeContext, final Thread mainThread) {
-    String executorServiceURI = System.getenv(CDAP_SPARK_EXECUTION_SERVICE_URI);
-    if (executorServiceURI == null) {
-      return null;
-    }
-
-    SparkDriverService driverService = new SparkDriverService(URI.create(executorServiceURI), runtimeContext);
-    driverService.addListener(new ServiceListenerAdapter() {
-      @Override
-      public void terminated(Service.State from) {
-        SparkRuntimeEnv.stop(Option.apply(mainThread));
-      }
-
-      @Override
-      public void failed(Service.State from, Throwable failure) {
-        SparkRuntimeEnv.stop(Option.apply(mainThread));
       }
     }, Threads.SAME_THREAD_EXECUTOR);
 
     driverService.startAndWait();
-    return driverService;
-  }
-
-  private SparkRuntimeUtils() {
-    // private
+    return new Cancellable() {
+      @Override
+      public void cancel() {
+        // If the cancel call is from the main thread, it means the calling to user class has been returned,
+        // since it's the last thing that Spark main methhod would do.
+        if (Thread.currentThread() == mainThread) {
+          mainThreadCallLatch.countDown();
+          restoreMainClassLoader.cancel();
+        }
+        driverService.stopAndWait();
+      }
+    };
   }
 }

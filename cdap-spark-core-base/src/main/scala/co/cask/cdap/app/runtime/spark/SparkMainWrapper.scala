@@ -84,6 +84,10 @@ object SparkMainWrapper {
         case cls =>
           getMainMethod(cls).invoke(null, RuntimeArguments.toPosixArray(runtimeContext.getRuntimeArguments))
       }
+    } catch {
+      // If it is stopped, ok to ignore the InterruptedException, as system issues interrupt to the main thread
+      // to unblock the main method.
+      case e: InterruptedException => if (!SparkRuntimeEnv.isStopped) throw e
     } finally {
       cancellable.cancel
     }
